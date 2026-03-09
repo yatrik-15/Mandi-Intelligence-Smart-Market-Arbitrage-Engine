@@ -7,6 +7,9 @@ Provides price predictions and profit-optimized recommendations.
 """
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 from pathlib import Path
@@ -25,6 +28,18 @@ app = FastAPI(
     description="ML-powered mandi price predictions and recommendations for farmers",
     version="2.0.0"
 )
+
+# Allow requests from browser (including file:// when UI is opened directly)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve static assets from the api/ directory (images, css, etc.)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent), name="static")
+
 
 # Global instances (loaded on startup)
 data_loader = None
@@ -95,7 +110,7 @@ async def startup_event():
         # Load dataset (use parent directory path)
         dataset_path = Path(__file__).parent.parent / 'dataset' / 'commodity_price.csv'
         data_loader.load_data(str(dataset_path))
-        df = data_loader.filter_and_process(days=90)
+        df = data_loader.filter_and_process(days=None)  # Use ALL 4 years for best accuracy
         
         # Initialize predictor
         predictor = PricePredictor()
@@ -118,21 +133,10 @@ async def startup_event():
         print("   System will operate in fallback mode")
 
 
-@app.get("/", tags=["Root"])
+@app.get("/", tags=["Root"], include_in_schema=False)
 async def root():
-    """Root endpoint with API information"""
-    return {
-        "service": "Mandi Intelligence API",
-        "version": "2.0.0",
-        "status": "operational",
-        "endpoints": {
-            "/recommend": "POST - Get ML-based mandi recommendations",
-            "/respond": "POST - Submit farmer feedback and actual sale data",
-            "/health": "GET - Health check",
-            "/mandis": "GET - List all available mandis",
-            "/docs": "GET - Interactive API documentation"
-        }
-    }
+    """Serve the farmer-facing UI"""
+    return FileResponse(Path(__file__).parent / "index.html")
 
 
 @app.get("/health", tags=["Health"])
@@ -150,21 +154,16 @@ async def health_check():
 async def get_recommendation(request: RecommendRequest):
     """
     Get ML-based mandi recommendations for optimal profit.
-    
-    This endpoint:
-    1. Analyzes current prices across all mandis
-    2. Predicts prices for the next 7 days
-    3. Calculates net profit after all costs
-    4. Recommends the best mandi and timing
-    
-    Returns the best option plus alternative choices.
+
+    Calls get_best_selling_strategy() which combines spatial + temporal arbitrage
+    to find the mandi and timing that maximises net profit for the farmer.
     """
     if latest_data is None or engine is None:
         raise HTTPException(
             status_code=503,
             detail="System not ready. Models are still loading."
         )
-    
+
     # Validate crop
     valid_crops = ['Onion', 'Tomato', 'Potato']
     if request.crop not in valid_crops:
@@ -172,53 +171,57 @@ async def get_recommendation(request: RecommendRequest):
             status_code=400,
             detail=f"Invalid crop. Must be one of: {', '.join(valid_crops)}"
         )
-    
+
     try:
-        # Get recommendation from arbitrage engine
-        result = engine.get_optimal_strategy(
-            latest_data,
-            predictor,
-            request.crop,
-            request.quantity
+        # Call the correct method with correct argument names
+        result = engine.get_best_selling_strategy(
+            current_qty_kg=request.quantity,
+            crop=request.crop,
+            current_location=request.farmer_location or "Gandhinagar",
+            df_current=latest_data,
         )
-        
-        # Format best option
-        best = result['best_option']
+
+        # ── Map optimal_strategy → MandiOption ──────────────────────────
+        opt = result.get("optimal_strategy", {})
+        breakdown = opt.get("cost_breakdown", {})
+        days_wait = opt.get("days_to_wait", 0)
+
         best_option = MandiOption(
-            mandi_name=best['mandi'],
-            distance_km=best.get('distance', 0),
-            current_price=best.get('current_price', 0),
-            predicted_price_7d=best.get('predicted_price', None),
-            gross_revenue=best['gross_revenue'],
-            transport_cost=best['transport_cost'],
-            storage_cost=best.get('storage_cost', 0),
-            net_profit=best['net_profit'],
-            recommendation=best['recommendation']
+            mandi_name=opt.get("mandi", "Unknown"),
+            distance_km=float(opt.get("distance_km", 0)),
+            current_price=float(opt.get("price_per_kg", 0)),
+            predicted_price_7d=float(opt.get("price_per_kg", 0)) if opt.get("is_predicted_price") else None,
+            gross_revenue=float(breakdown.get("gross_revenue", 0)),
+            transport_cost=float(breakdown.get("transport_cost", 0)),
+            storage_cost=float(breakdown.get("storage_cost", 0)),
+            net_profit=float(opt.get("net_profit", 0)),
+            recommendation="Sell Now" if days_wait == 0 else f"Wait {days_wait} days"
         )
-        
-        # Format alternatives
+
+        # ── Map alternative_scenarios → List[MandiOption] ───────────────
         alternatives = []
-        for alt in result.get('alternatives', [])[:3]:  # Top 3 alternatives
+        for alt in result.get("alternative_scenarios", [])[:3]:
+            alt_days = alt.get("days_to_wait", 0)
             alternatives.append(MandiOption(
-                mandi_name=alt['mandi'],
-                distance_km=alt.get('distance', 0),
-                current_price=alt.get('current_price', 0),
-                predicted_price_7d=alt.get('predicted_price', None),
-                gross_revenue=alt['gross_revenue'],
-                transport_cost=alt['transport_cost'],
-                storage_cost=alt.get('storage_cost', 0),
-                net_profit=alt['net_profit'],
-                recommendation=alt['recommendation']
+                mandi_name=alt.get("mandi_name", "Unknown"),
+                distance_km=float(alt.get("distance_km", 0)),
+                current_price=float(alt.get("price_per_kg", 0)),
+                predicted_price_7d=float(alt.get("price_per_kg", 0)) if alt.get("is_predicted") else None,
+                gross_revenue=float(alt.get("gross_revenue", 0)),
+                transport_cost=float(alt.get("transport_cost", 0)),
+                storage_cost=float(alt.get("storage_cost", 0)),
+                net_profit=float(alt.get("net_profit", 0)),
+                recommendation="Sell Now" if alt_days == 0 else f"Wait {alt_days} days"
             ))
-        
+
         return RecommendResponse(
             crop=request.crop,
             quantity=request.quantity,
             best_option=best_option,
             alternatives=alternatives,
-            summary=result.get('summary', 'Recommendation generated successfully')
+            summary=result.get("justification", "Recommendation generated successfully")
         )
-        
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
