@@ -1,12 +1,15 @@
 """
-Mandi Arbitrage Engine - Main Demonstration Script
-===================================================
+Mandi Arbitrage Engine v3.0 — Main Demonstration Script
+========================================================
 
 This script demonstrates the complete ML-powered arbitrage system:
 1. Load/Generate mandi price data
 2. Train XGBoost models for price forecasting  
 3. Run example scenarios showing spatial + temporal arbitrage
 4. Output structured JSON recommendations with detailed justifications
+
+Transport cost model: 5-component (fuel + driver + tolls + maintenance + L/U)
+Storage cost: ₹50/quintal/day (industry cold-storage rate)
 
 Run this to see the system in action!
 """
@@ -42,7 +45,7 @@ def print_json_pretty(data: dict, title: str = ""):
 def main():
     """Main execution flow."""
     
-    print_header("MANDI ARBITRAGE ENGINE - ML-Powered Profit Maximization")
+    print_header("MANDI ARBITRAGE ENGINE v3.0 — ML-Powered Profit Maximization")
     
     print("📋 SYSTEM OVERVIEW")
     print("-" * 80)
@@ -51,9 +54,11 @@ def main():
     print("  • XGBoost ML models for 7-day price forecasting")
     print("  • Dual arbitrage logic: Spatial (where?) + Temporal (when?)")
     print()
-    print("NET PROFIT FORMULA:")
-    print("  Net Profit = (Price × Qty) - (Distance × ₹5/km) - (Storage × ₹0.50/kg/day)")
-    print("              - (Perishability × Days × GrossRevenue) - (Traffic × Spoilage)")
+    print("NET PROFIT FORMULA (v3.0 — 5-component transport):")
+    print("  Net Profit = (qty_remaining × price_future)")
+    print("             − transport_cost(fuel + driver + toll + maint + L/U)")
+    print("             − (wait_days × qty_quintal × ₹50/quintal/day)")
+    print("             − spoilage(exponential decay: qty × exp(−λ × t))")
     print()
     
     # ============================================================================
@@ -66,7 +71,7 @@ def main():
     
     # Try to load real Kaggle data from dataset folder FIRST
     real_data_paths = [
-        "dataset/commodity_price.csv",  # Primary location (user's downloaded data)
+        "dataset/commodity_price.csv",
         "../dataset/commodity_price.csv",
         "data/mandi_prices.csv",
         "../data/mandi_prices.csv",
@@ -77,15 +82,15 @@ def main():
     for path in real_data_paths:
         try:
             loader.load_data(path)
-            df = loader.filter_and_process(days=90)
+            df = loader.filter_and_process(days=None)
             print("✅ Using REAL Kaggle data")
             break
-        except FileNotFoundError:
+        except (FileNotFoundError, Exception):
             continue
     
-    if df is None:
+    if df is None or df.empty:
         print("⚠️  Real data not found. Generating synthetic data for demonstration...")
-        df = loader.generate_synthetic_data(days=90)
+        df = loader.generate_rich_synthetic_data()
     
     # Show summary
     stats = loader.get_summary_stats()
@@ -106,7 +111,7 @@ def main():
     print("🔧 Engineering time-series features...")
     df_featured = predictor.prepare_features(df)
     
-    print(f"   Added features: lag prices, moving averages, trends, seasonality")
+    print(f"   Added features: lag prices, moving averages, EMA, trends, seasonality")
     print(f"   Total features: {len(df_featured.columns)}")
     print()
     
@@ -120,7 +125,7 @@ def main():
     for result in results:
         if 'error' not in result:
             print(f"  {result['mandi']} - {result['crop']}: "
-                  f"MAE=₹{result['mae']:.2f}/kg | MAPE={result['mape']:.1f}%")
+                  f"MAE=₹{result['mae']:.2f}/kg | MAPE={result['mape']:.1f}% | R²={result['r2']:.3f}")
     
     # ============================================================================
     # STEP 3: Initialize Arbitrage Engine
@@ -132,9 +137,9 @@ def main():
     
     print("✅ Engine initialized with:")
     print(f"   • Price predictor: {len(predictor.models)} trained models")
-    print(f"   • Perishability factors: {list(engine.perishability_factors.keys())}")
-    print(f"   • Fuel cost: ₹{engine.FUEL_COST_PER_KM}/km (as specified)")
-    print(f"   • Storage cost: ₹{engine.STORAGE_COST_PER_KG_DAY}/kg/day (as specified)")
+    print(f"   • Transport model: 5-component (₹94.37/L petrol)")
+    print(f"   • Storage cost: ₹50/quintal/day")
+    print(f"   • Spoilage model: Exponential decay")
     
     # ============================================================================
     # STEP 4: Run Example Scenarios
@@ -157,12 +162,14 @@ def main():
                 forecasts_data.append({
                     'Mandi_Name': mandi,
                     'Crop': crop,
-                    'Day_Ahead': row['Day_Ahead'],
-                    'Predicted_Price': row['Predicted_Price']
+                    'Day_Ahead': int(row['Day_Ahead']),
+                    'Predicted_Price': float(row['Predicted_Price']),
+                    'Lower_Bound': float(row.get('Lower_Bound', row['Predicted_Price'])),
+                    'Upper_Bound': float(row.get('Upper_Bound', row['Predicted_Price'])),
                 })
     
-    df_forecast = pd.DataFrame(forecasts_data)
-    print(f"   Generated {len(df_forecast)} price predictions")
+    df_forecast = pd.DataFrame(forecasts_data) if forecasts_data else None
+    print(f"   Generated {len(forecasts_data)} price predictions")
     
     # ============================================================================
     # SCENARIO 1: Cotton Farmer with 1000 kg
@@ -185,36 +192,13 @@ def main():
         crop_perishability_factor=0.005
     )
     
-    print_json_pretty(recommendation_1, "💡 RECOMMENDATION")
+    _display_recommendation(recommendation_1, "💡 RECOMMENDATION")
     
     # ============================================================================
-    # SCENARIO 2: Wheat Farmer with 500 kg
+    # SCENARIO 2: Onion Farmer with 2000 kg
     # ============================================================================
     
-    print_header("SCENARIO 2: Wheat Farmer with 500 kg (Medium Perishability)")
-    
-    print("🌾 Farmer Profile:")
-    print("   Crop: Wheat")
-    print("   Quantity: 500 kg")
-    print("   Perishability: 0.01 (low-medium - grains are fairly stable)")
-    print()
-    
-    recommendation_2 = engine.get_best_selling_strategy(
-        current_qty_kg=500,
-        crop='Wheat',
-        current_location='Gandhinagar',
-        df_current=df_current,
-        df_forecast=df_forecast,
-        crop_perishability_factor=0.01
-    )
-    
-    print_json_pretty(recommendation_2, "💡 RECOMMENDATION")
-    
-    # ============================================================================
-    # SCENARIO 3: Onion Farmer with 2000 kg
-    # ============================================================================
-    
-    print_header("SCENARIO 3: Onion Farmer with 2000 kg (High Perishability)")
+    print_header("SCENARIO 2: Onion Farmer with 2000 kg (High Perishability)")
     
     print("🧅 Farmer Profile:")
     print("   Crop: Onion")
@@ -222,7 +206,7 @@ def main():
     print("   Perishability: 0.03 (higher - onions degrade faster)")
     print()
     
-    recommendation_3 = engine.get_best_selling_strategy(
+    recommendation_2 = engine.get_best_selling_strategy(
         current_qty_kg=2000,
         crop='Onion',
         current_location='Gandhinagar',
@@ -231,37 +215,7 @@ def main():
         crop_perishability_factor=0.03
     )
     
-    print_json_pretty(recommendation_3, "💡 RECOMMENDATION")
-    
-    # ============================================================================
-    # STEP 5: Mathematical Verification
-    # ============================================================================
-    
-    print_header("STEP 5: Net Profit Calculation Verification")
-    
-    print("📐 Let's verify the math for Scenario 1 (Cotton):")
-    print("-" * 80)
-    
-    opt = recommendation_1['optimal_strategy']
-    breakdown = opt['cost_breakdown']
-    
-    print(f"\nINPUTS:")
-    print(f"  Price: ₹{opt['price_per_kg']}/kg")
-    print(f"  Quantity: 1,000 kg")
-    print(f"  Distance: {opt['distance_km']} km")
-    print(f"  Days to wait: {opt['days_to_wait']} days")
-    
-    print(f"\nCALCULATIONS:")
-    print(f"  1. Gross Revenue = ₹{opt['price_per_kg']} × 1000 kg = ₹{breakdown['gross_revenue']:,.0f}")
-    print(f"  2. Transport Cost = {opt['distance_km']} km × ₹5/km = ₹{breakdown['transport_cost']:,.0f}")
-    print(f"  3. Storage Cost = {opt['days_to_wait']} days × 1000 kg × ₹0.50 = ₹{breakdown['storage_cost']:,.0f}")
-    print(f"  4. Perishability Cost = {opt['days_to_wait']} days × 0.005 × ₹{breakdown['gross_revenue']:,.0f} = ₹{breakdown['perishability_cost']:,.0f}")
-    print(f"  5. Traffic Delay Cost = (traffic impact on freshness) = ₹{breakdown['traffic_cost']:,.0f}")
-    
-    print(f"\nFINAL CALCULATION:")
-    print(f"  Net Profit = ₹{breakdown['gross_revenue']:,.0f} - ₹{breakdown['total_costs']:,.0f}")
-    print(f"  Net Profit = ₹{opt['net_profit']:,.0f}")
-    print(f"\n  Profit Margin: {opt['net_profit'] / breakdown['gross_revenue'] * 100:.1f}%")
+    _display_recommendation(recommendation_2, "💡 RECOMMENDATION")
     
     # ============================================================================
     # Summary
@@ -278,18 +232,58 @@ def main():
     print()
     print("📁 Generated files:")
     print(f"   • {output_path}")
-    print(f"   • ml_arbitrage/models/*.pkl (trained models)")
+    print(f"   • ml_arbitrage/models/*.ubj (trained models)")
     print()
-    print("🎯 Key Features:")
-    print("   • Accounts for transportation costs (₹5/km)")
-    print("   • Accounts for storage costs (₹0.50/kg/day)")
-    print("   • Accounts for perishability (varies by crop)")
-    print("   • Accounts for traffic congestion effects")
-    print("   • Provides clear justifications for judges")
+    print("🎯 Key Features (v3.0):")
+    print("   • 5-component transport costs (fuel + driver + tolls + maint + L/U)")
+    print("   • Exponential decay spoilage model")
+    print("   • ₹50/quintal/day cold storage rate")
+    print("   • Confidence intervals on price forecasts")
+    print("   • Pipeline: Prophet → TFT → ArbitrageMath → CatBoost")
     print()
     print("=" * 80)
     print("  Ready for evaluation! 🚀")
     print("=" * 80)
+
+
+def _display_recommendation(rec: dict, title: str):
+    """Pretty-print a recommendation dict."""
+    print(f"\n{title}:")
+    print("-" * 60)
+    
+    if "error" in rec:
+        print(f"  ❌ {rec['error']}")
+        return
+    
+    opt = rec.get("optimal_strategy", {})
+    bd = opt.get("cost_breakdown", {})
+    td = bd.get("transport_detail", {})
+    
+    print(f"  🎯 {rec['recommendation']}")
+    print(f"  Mandi: {opt.get('mandi', 'N/A')} ({opt.get('distance_km', 0):.0f} km)")
+    print(f"  Price: ₹{opt.get('price_per_kg', 0):.2f}/kg"
+          + ("  [PREDICTED]" if opt.get("is_predicted_price") else "  [CURRENT]"))
+    if opt.get("days_to_wait", 0) > 0:
+        print(f"  Days to wait: {opt['days_to_wait']}")
+    print(f"  Qty remaining: {bd.get('qty_remaining_kg', 'N/A')} kg")
+    print()
+    print(f"  Gross revenue:  ₹{bd.get('gross_revenue', 0):>12,.2f}")
+    if td:
+        print(f"  Transport cost: ₹{bd.get('transport_cost', 0):>12,.2f}")
+        print(f"    Vehicle: {td.get('vehicle', 'LCV')}")
+        print(f"    Fuel:         ₹{td.get('fuel', 0):>10,.2f}")
+        print(f"    Driver:       ₹{td.get('driver', 0):>10,.2f}")
+        print(f"    Tolls:        ₹{td.get('toll', 0):>10,.2f}")
+        print(f"    Maintenance:  ₹{td.get('maintenance', 0):>10,.2f}")
+        print(f"    Load/Unload:  ₹{td.get('loading_unloading', 0):>10,.2f}")
+    print(f"  Storage cost:   ₹{bd.get('storage_cost', 0):>12,.2f}")
+    print(f"  Spoilage cost:  ₹{bd.get('perishability_cost', 0):>12,.2f}")
+    print(f"  {'─' * 40}")
+    print(f"  NET PROFIT:     ₹{opt.get('net_profit', 0):>12,.2f}")
+    print(f"  Margin:         {opt.get('margin_pct', 0):+.1f}%")
+    print()
+    print(f"  {rec.get('justification', '')}")
+    print()
 
 
 if __name__ == "__main__":

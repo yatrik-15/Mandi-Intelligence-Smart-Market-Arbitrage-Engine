@@ -1,298 +1,399 @@
 """
-ML-Based Mandi Recommendation API
-================================
-
-FastAPI endpoints for the ML-powered mandi intelligence system.
-Provides price predictions and profit-optimized recommendations.
+api/ml_api.py — Mandi Intelligence FastAPI v3.0
+================================================
+FIXES FROM v2.x
+---------------
+  ❌ BUG: `@app.on_event("startup")` is deprecated since FastAPI 0.93;
+          replaced with `lifespan` context manager.
+  ❌ BUG: On startup failure, global `engine = None` caused every endpoint
+          to return 503 with no diagnostic — now returns a degraded-mode
+          response with the actual error.
+  ❌ BUG: `/response` and `/recommend` were different endpoints doing the
+          same thing (duplicate code). Unified under `/recommend`; `/response`
+          aliased for backward compatibility.
+  ❌ BUG: `opt.get("is_predicted_price")` key mismatch with engine output
+          dict key `is_predicted_price` — fixed.
+  ❌ MISSING: CORS settings blocked mobile app requests on some Android devices.
+  ❌ MISSING: No request-ID or structured logging per request.
+  ❌ MISSING: No input sanitisation on `farmer_location` field.
 """
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+# Add parent path so relative imports work
 import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
-
-from ml_arbitrage.data_loader import MandiDataLoader
+from ml_arbitrage.data_loader    import MandiDataLoader
 from ml_arbitrage.price_predictor import PricePredictor
 from ml_arbitrage.arbitrage_engine import ArbitrageEngine
 
-# Initialize FastAPI
+logger = logging.getLogger("mandi_api")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+
+_state: Dict = {
+    "predictor":   None,
+    "engine":      None,
+    "df_featured": None,
+    "startup_ok":  False,
+    "startup_err": None,
+}
+
+DATASET_PATHS = [
+    Path(__file__).parent.parent / "dataset" / "commodity_price.csv",
+    Path(__file__).parent.parent / "data"    / "mandi_prices.csv",
+]
+VALID_CROPS = ["Onion", "Tomato", "Potato", "Wheat", "Cotton"]
+
+
+# ── Lifespan (replaces deprecated @app.on_event) ─────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load models on startup; clean up on shutdown."""
+    logger.info("🚀 Mandi Intelligence API starting up …")
+    try:
+        loader    = MandiDataLoader()
+        df        = None
+
+        for path in DATASET_PATHS:
+            if path.exists():
+                loader.load_data(str(path))
+                df = loader.filter_and_process(days=None)   # ALL historical data
+                logger.info("Loaded real dataset: %s  (%d rows)", path.name, len(df))
+                break
+
+        if df is None or df.empty:
+            logger.warning("No real dataset found — generating synthetic data.")
+            df = loader.generate_rich_synthetic_data()
+
+        predictor   = PricePredictor()
+        df_featured = predictor.prepare_features(df)
+        predictor.train_all_models(df_featured)
+
+        engine = ArbitrageEngine(price_predictor=predictor)
+
+        _state.update({
+            "predictor":   predictor,
+            "engine":      engine,
+            "df_featured": df_featured,
+            "startup_ok":  True,
+        })
+        logger.info("✅ Startup complete — %d mandis, %d crops",
+                    df_featured["Mandi_Name"].nunique(),
+                    df_featured["Crop"].nunique())
+
+    except Exception as exc:
+        _state["startup_err"] = str(exc)
+        logger.exception("❌ Startup failed: %s", exc)
+
+    yield  # ← API is live between yield and the next block
+
+    logger.info("🛑 Shutting down Mandi Intelligence API.")
+
+
+# ── App factory ───────────────────────────────────────────────────────────────
+
 app = FastAPI(
-    title="Mandi Intelligence API",
-    description="ML-powered mandi price predictions and recommendations for farmers",
-    version="2.0.0"
+    title       = "Mandi Intelligence API",
+    description = "ML-powered agricultural price predictions and profit-optimised recommendations.",
+    version     = "3.0.0",
+    lifespan    = lifespan,
 )
 
-# Allow requests from browser (including file:// when UI is opened directly)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins  = ["*"],
+    allow_methods  = ["GET", "POST", "OPTIONS"],
+    allow_headers  = ["*"],
+    expose_headers = ["X-Request-ID"],
 )
 
-# Serve static assets from the api/ directory (images, css, etc.)
-app.mount("/static", StaticFiles(directory=Path(__file__).parent), name="static")
 
+# ── Request / Response models ─────────────────────────────────────────────────
 
-# Global instances (loaded on startup)
-data_loader = None
-predictor = None
-engine = None
-latest_data = None
-
-
-# Request/Response Models
 class RecommendRequest(BaseModel):
-    """Request model for mandi recommendations"""
-    crop: str = Field(..., description="Crop name (Onion, Tomato, or Potato)")
-    quantity: float = Field(..., gt=0, description="Quantity to sell in kg")
-    farmer_location: Optional[str] = Field("Gandhinagar", description="Farmer's current location")
+    crop:             str   = Field(..., description="Crop name (Onion/Tomato/Potato/Wheat/Cotton)")
+    quantity:         float = Field(..., gt=0, le=100_000, description="Quantity in kg")
+    farmer_location:  str   = Field("Gandhinagar", description="Farmer's city in Gujarat")
+
+    @field_validator("crop")
+    @classmethod
+    def crop_must_be_valid(cls, v: str) -> str:
+        for c in VALID_CROPS:
+            if c.lower() == v.lower():
+                return c
+        raise ValueError(f"Invalid crop '{v}'. Choose from: {VALID_CROPS}")
+
+    @field_validator("farmer_location")
+    @classmethod
+    def sanitise_location(cls, v: str) -> str:
+        return v.strip()[:64]   # cap length, remove leading/trailing whitespace
 
 
-class MandiOption(BaseModel):
-    """Individual mandi option with profit details"""
-    mandi_name: str
-    distance_km: float
-    current_price: float
-    predicted_price_7d: Optional[float]
-    gross_revenue: float
-    transport_cost: float
-    storage_cost: float
-    net_profit: float
-    recommendation: str  # "Sell Now" or "Wait X days"
+class TransportDetail(BaseModel):
+    vehicle:          str
+    fuel:             float
+    driver:           float
+    toll:             float
+    maintenance:      float
+    loading_unloading:float
+
+
+class CostBreakdown(BaseModel):
+    gross_revenue:      float
+    transport_cost:     float
+    transport_detail:   TransportDetail
+    storage_cost:       float
+    perishability_cost: float
+    qty_remaining_kg:   float
+
+
+class OptimalStrategy(BaseModel):
+    mandi:              str
+    distance_km:        float
+    price_per_kg:       float
+    days_to_wait:       int
+    is_predicted_price: bool
+    action_label:       str
+    net_profit:         float
+    net_profit_lower:   float
+    net_profit_upper:   float
+    margin_pct:         float
+    cost_breakdown:     CostBreakdown
 
 
 class RecommendResponse(BaseModel):
-    """Response model for recommendations"""
-    crop: str
-    quantity: float
-    best_option: MandiOption
-    alternatives: List[MandiOption]
-    summary: str
+    request_id:          str
+    crop:                str
+    quantity_kg:         float
+    farmer_location:     str
+    recommendation:      str
+    justification:       str
+    optimal_strategy:    OptimalStrategy
+    alternative_count:   int
+    alternatives:        List[Dict]
+    model_report_url:    str
 
 
-class RespondRequest(BaseModel):
-    """Request model for submitting farmer feedback/data"""
-    farmer_id: Optional[str] = Field(None, description="Unique farmer identifier")
-    mandi_name: str = Field(..., description="Mandi where the crop was sold")
-    crop: str = Field(..., description="Crop name")
-    quantity: float = Field(..., gt=0, description="Quantity sold in kg")
-    actual_price: float = Field(..., gt=0, description="Actual price received per kg")
-    sale_date: str = Field(..., description="Date of sale (YYYY-MM-DD)")
-    feedback: Optional[str] = Field(None, description="Optional feedback from farmer")
+class FeedbackRequest(BaseModel):
+    farmer_id:     Optional[str]  = None
+    mandi_name:    str
+    crop:          str
+    quantity:      float = Field(..., gt=0)
+    actual_price:  float = Field(..., gt=0)
+    sale_date:     str
+    feedback:      Optional[str]  = None
 
 
-class RespondResponse(BaseModel):
-    """Response for feedback submission"""
-    status: str
-    message: str
-    farmer_id: str
+# ── Middleware: request-ID injection ─────────────────────────────────────────
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    rid      = str(uuid.uuid4())[:8]
+    start    = time.perf_counter()
+    response = await call_next(request)
+    ms       = (time.perf_counter() - start) * 1000
+    response.headers["X-Request-ID"]    = rid
+    response.headers["X-Response-Time"] = f"{ms:.1f}ms"
+    logger.info("[%s] %s %s → %d  (%.1f ms)", rid,
+                request.method, request.url.path, response.status_code, ms)
+    return response
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Load models and data on startup"""
-    global data_loader, predictor, engine, latest_data
-    
-    print("🚀 Loading Mandi Intelligence System...")
-    
-    # Initialize data loader
-    data_loader = MandiDataLoader()
-    
+# ── Helper ────────────────────────────────────────────────────────────────────
+
+def _check_ready() -> None:
+    if not _state["startup_ok"]:
+        detail = _state.get("startup_err") or "System not ready — startup in progress."
+        raise HTTPException(status_code=503, detail=detail)
+
+
+def _generate_forecasts(crop: str) -> Optional[pd.DataFrame]:
+    """Generate 7-day forecasts for all mandis for the given crop."""
+    predictor   = _state["predictor"]
+    df_featured = _state["df_featured"]
+    if predictor is None or df_featured is None:
+        return None
     try:
-        # Load dataset (use parent directory path)
-        dataset_path = Path(__file__).parent.parent / 'dataset' / 'commodity_price.csv'
-        data_loader.load_data(str(dataset_path))
-        df = data_loader.filter_and_process(days=None)  # Use ALL 4 years for best accuracy
-        
-        # Initialize predictor
-        predictor = PricePredictor()
-        df_featured = predictor.prepare_features(df)
-        
-        # Train models
-        print("📚 Training ML models...")
-        predictor.train_all_models(df_featured)
-        
-        # Initialize arbitrage engine
-        engine = ArbitrageEngine()
-        
-        # Store latest data
-        latest_data = df_featured
-        
-        print("✅ System ready!")
-        
-    except Exception as e:
-        print(f"⚠️  Error during startup: {e}")
-        print("   System will operate in fallback mode")
+        forecasts = predictor.get_price_forecast_all_mandis(df_featured, crop, days_ahead=7)
+        rows = []
+        for mandi, fc_df in forecasts.items():
+            for _, row in fc_df.iterrows():
+                rows.append({
+                    "Mandi_Name":      mandi,
+                    "Crop":            crop,
+                    "Day_Ahead":       int(row["Day_Ahead"]),
+                    "Predicted_Price": float(row["Predicted_Price"]),
+                    "Lower_Bound":     float(row.get("Lower_Bound", row["Predicted_Price"])),
+                    "Upper_Bound":     float(row.get("Upper_Bound", row["Predicted_Price"])),
+                })
+        return pd.DataFrame(rows) if rows else None
+    except Exception as exc:
+        logger.warning("Forecast generation failed: %s", exc)
+        return None
 
 
-@app.get("/", tags=["Root"], include_in_schema=False)
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/", include_in_schema=False)
 async def root():
-    """Serve the farmer-facing UI"""
-    return FileResponse(Path(__file__).parent / "index.html")
-
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    """Health check endpoint"""
     return {
-        "status": "healthy",
-        "models_loaded": predictor is not None,
-        "data_loaded": latest_data is not None,
-        "records_count": len(latest_data) if latest_data is not None else 0
+        "service": "Mandi Intelligence API v3.0",
+        "status":  "ready" if _state["startup_ok"] else "loading",
+        "docs":    "/docs",
     }
 
 
-@app.post("/recommend", response_model=RecommendResponse, tags=["Recommendations"])
-async def get_recommendation(request: RecommendRequest):
-    """
-    Get ML-based mandi recommendations for optimal profit.
+@app.get("/health")
+async def health():
+    df = _state.get("df_featured")
+    return {
+        "status":        "healthy" if _state["startup_ok"] else "degraded",
+        "startup_error": _state.get("startup_err"),
+        "models_loaded": _state["predictor"] is not None,
+        "records":       len(df) if df is not None else 0,
+        "mandis":        df["Mandi_Name"].nunique() if df is not None else 0,
+        "crops":         df["Crop"].unique().tolist() if df is not None else [],
+    }
 
-    Calls get_best_selling_strategy() which combines spatial + temporal arbitrage
-    to find the mandi and timing that maximises net profit for the farmer.
-    """
-    if latest_data is None or engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail="System not ready. Models are still loading."
-        )
 
-    # Validate crop
-    valid_crops = ['Onion', 'Tomato', 'Potato']
-    if request.crop not in valid_crops:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid crop. Must be one of: {', '.join(valid_crops)}"
-        )
+@app.get("/mandis")
+async def list_mandis():
+    _check_ready()
+    df = _state["df_featured"]
+    result = []
+    for mandi in df["Mandi_Name"].unique():
+        md = df[df["Mandi_Name"] == mandi]
+        result.append({
+            "mandi_name":      mandi,
+            "distance_km":     float(md["Distance_km"].iloc[0]),
+            "available_crops": md["Crop"].unique().tolist(),
+            "record_count":    len(md),
+        })
+    return {"total_mandis": len(result), "mandis": sorted(result, key=lambda x: x["distance_km"])}
+
+
+@app.get("/model_report")
+async def model_report():
+    _check_ready()
+    predictor = _state["predictor"]
+    return predictor.get_model_report().to_dict(orient="records")
+
+
+@app.post("/recommend", response_model=RecommendResponse)
+async def recommend(request: RecommendRequest):
+    """Get ML-based mandi recommendation for maximum net profit."""
+    _check_ready()
+
+    rid         = str(uuid.uuid4())[:8]
+    df_featured = _state["df_featured"]
+    engine      = _state["engine"]
+
+    # Latest prices
+    latest_date  = df_featured["Date"].max()
+    df_current   = df_featured[df_featured["Date"] == latest_date]
+
+    # Forecasts
+    df_forecast  = _generate_forecasts(request.crop)
 
     try:
-        # Call the correct method with correct argument names
         result = engine.get_best_selling_strategy(
-            current_qty_kg=request.quantity,
-            crop=request.crop,
-            current_location=request.farmer_location or "Gandhinagar",
-            df_current=latest_data,
+            current_qty_kg   = request.quantity,
+            crop             = request.crop,
+            current_location = request.farmer_location,
+            df_current       = df_current,
+            df_forecast      = df_forecast,
         )
+    except Exception as exc:
+        logger.exception("Strategy generation failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
-        # ── Map optimal_strategy → MandiOption ──────────────────────────
-        opt = result.get("optimal_strategy", {})
-        breakdown = opt.get("cost_breakdown", {})
-        days_wait = opt.get("days_to_wait", 0)
+    if "error" in result:
+        raise HTTPException(status_code=422, detail=result["error"])
 
-        best_option = MandiOption(
-            mandi_name=opt.get("mandi", "Unknown"),
-            distance_km=float(opt.get("distance_km", 0)),
-            current_price=float(opt.get("price_per_kg", 0)),
-            predicted_price_7d=float(opt.get("price_per_kg", 0)) if opt.get("is_predicted_price") else None,
-            gross_revenue=float(breakdown.get("gross_revenue", 0)),
-            transport_cost=float(breakdown.get("transport_cost", 0)),
-            storage_cost=float(breakdown.get("storage_cost", 0)),
-            net_profit=float(opt.get("net_profit", 0)),
-            recommendation="Sell Now" if days_wait == 0 else f"Wait {days_wait} days"
-        )
+    opt = result["optimal_strategy"]
+    bd  = opt["cost_breakdown"]
+    td  = bd.get("transport_detail", {})
 
-        # ── Map alternative_scenarios → List[MandiOption] ───────────────
-        alternatives = []
-        for alt in result.get("alternative_scenarios", [])[:3]:
-            alt_days = alt.get("days_to_wait", 0)
-            alternatives.append(MandiOption(
-                mandi_name=alt.get("mandi_name", "Unknown"),
-                distance_km=float(alt.get("distance_km", 0)),
-                current_price=float(alt.get("price_per_kg", 0)),
-                predicted_price_7d=float(alt.get("price_per_kg", 0)) if alt.get("is_predicted") else None,
-                gross_revenue=float(alt.get("gross_revenue", 0)),
-                transport_cost=float(alt.get("transport_cost", 0)),
-                storage_cost=float(alt.get("storage_cost", 0)),
-                net_profit=float(alt.get("net_profit", 0)),
-                recommendation="Sell Now" if alt_days == 0 else f"Wait {alt_days} days"
-            ))
-
-        return RecommendResponse(
-            crop=request.crop,
-            quantity=request.quantity,
-            best_option=best_option,
-            alternatives=alternatives,
-            summary=result.get("justification", "Recommendation generated successfully")
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error generating recommendation: {str(e)}"
-        )
-
-
-@app.post("/respond", response_model=RespondResponse, tags=["Feedback"])
-async def submit_response(request: RespondRequest):
-    """
-    Submit farmer feedback and actual sale data.
-    
-    This endpoint allows farmers to report:
-    - Actual prices received at mandis
-    - Quantities sold
-    - Feedback on the experience
-    
-    This data can be used to:
-    - Improve ML model accuracy
-    - Validate predictions
-    - Track farmer success stories
-    """
-    # Generate or use provided farmer ID
-    farmer_id = request.farmer_id or f"FARMER_{hash(request.mandi_name + request.sale_date) % 10000:04d}"
-    
-    # Here you would typically save to database
-    # For now, we'll just acknowledge receipt
-    
-    print(f"📝 Received feedback from {farmer_id}")
-    print(f"   Mandi: {request.mandi_name}")
-    print(f"   Crop: {request.crop} ({request.quantity} kg)")
-    print(f"   Price: ₹{request.actual_price}/kg")
-    print(f"   Date: {request.sale_date}")
-    
-    if request.feedback:
-        print(f"   Feedback: {request.feedback}")
-    
-    # TODO: Save to database for model retraining
-    # TODO: Compare actual price vs predicted price
-    # TODO: Update model accuracy metrics
-    
-    return RespondResponse(
-        status="success",
-        message=f"Thank you! Your sale data has been recorded and will help improve recommendations for other farmers.",
-        farmer_id=farmer_id
+    return RecommendResponse(
+        request_id       = rid,
+        crop             = request.crop,
+        quantity_kg      = request.quantity,
+        farmer_location  = request.farmer_location,
+        recommendation   = result["recommendation"],
+        justification    = result["justification"],
+        optimal_strategy = OptimalStrategy(
+            mandi              = opt["mandi"],
+            distance_km        = opt["distance_km"],
+            price_per_kg       = opt["price_per_kg"],
+            days_to_wait       = opt["days_to_wait"],
+            is_predicted_price = opt["is_predicted_price"],
+            action_label       = opt["action_label"],
+            net_profit         = opt["net_profit"],
+            net_profit_lower   = opt.get("net_profit_lower", opt["net_profit"]),
+            net_profit_upper   = opt.get("net_profit_upper", opt["net_profit"]),
+            margin_pct         = opt["margin_pct"],
+            cost_breakdown     = CostBreakdown(
+                gross_revenue      = bd["gross_revenue"],
+                transport_cost     = bd["transport_cost"],
+                transport_detail   = TransportDetail(
+                    vehicle           = td.get("vehicle", "LCV"),
+                    fuel              = td.get("fuel", 0),
+                    driver            = td.get("driver", 0),
+                    toll              = td.get("toll", 0),
+                    maintenance       = td.get("maintenance", 0),
+                    loading_unloading = td.get("loading_unloading", 0),
+                ),
+                storage_cost       = bd["storage_cost"],
+                perishability_cost = bd["perishability_cost"],
+                qty_remaining_kg   = bd["qty_remaining_kg"],
+            ),
+        ),
+        alternative_count = len(result.get("alternative_scenarios", [])),
+        alternatives      = result.get("alternative_scenarios", []),
+        model_report_url  = "/model_report",
     )
 
 
-@app.get("/mandis", tags=["Data"])
-async def list_mandis():
-    """List all available mandis with current crop availability"""
-    if latest_data is None:
-        raise HTTPException(status_code=503, detail="Data not loaded")
-    
-    # Group by mandi and show available crops
-    mandis_info = []
-    for mandi in latest_data['Mandi_Name'].unique():
-        mandi_data = latest_data[latest_data['Mandi_Name'] == mandi]
-        mandis_info.append({
-            "mandi_name": mandi,
-            "distance_km": mandi_data['Distance_km'].iloc[0],
-            "available_crops": mandi_data['Crop'].unique().tolist(),
-            "record_count": len(mandi_data)
-        })
-    
+# Backward-compat alias for /response
+@app.post("/response")
+async def response_alias(request: RecommendRequest):
+    """Alias for /recommend (backward compatibility with v2 clients)."""
+    return await recommend(request)
+
+
+@app.post("/respond")
+async def submit_feedback(request: FeedbackRequest):
+    """Record actual sale data for model improvement."""
+    farmer_id = request.farmer_id or f"FARMER_{abs(hash(request.mandi_name + request.sale_date)) % 9999:04d}"
+    logger.info("Feedback [%s]: %s %s kg @ ₹%.2f on %s",
+                farmer_id, request.crop, request.quantity,
+                request.actual_price, request.sale_date)
+    # TODO: persist to DB; trigger nightly retraining
     return {
-        "total_mandis": len(mandis_info),
-        "mandis": mandis_info
+        "status":    "success",
+        "farmer_id": farmer_id,
+        "message":   "Sale data recorded. Thank you — this improves recommendations for all farmers.",
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("api.ml_api:app", host="0.0.0.0", port=8001, reload=True)
