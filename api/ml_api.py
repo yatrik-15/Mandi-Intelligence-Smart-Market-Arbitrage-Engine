@@ -39,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ml_arbitrage.data_loader    import MandiDataLoader
 from ml_arbitrage.price_predictor import PricePredictor
-from ml_arbitrage.arbitrage_engine import ArbitrageEngine
+from ml_arbitrage.arbitrage_engine import (
+    ArbitrageEngine, get_petrol_price, set_petrol_price,
+)
 
 logger = logging.getLogger("mandi_api")
 logging.basicConfig(level=logging.INFO,
@@ -132,6 +134,7 @@ class RecommendRequest(BaseModel):
     crop:             str   = Field(..., description="Crop name (Onion/Tomato/Potato/Wheat/Cotton)")
     quantity:         float = Field(..., gt=0, le=100_000, description="Quantity in kg")
     farmer_location:  str   = Field("Gandhinagar", description="Farmer's city in Gujarat")
+    petrol_price:     Optional[float] = Field(None, gt=0, le=500, description="Optional petrol price in Rs/L (uses system default if omitted)")
 
     @field_validator("crop")
     @classmethod
@@ -149,6 +152,8 @@ class RecommendRequest(BaseModel):
 
 class TransportDetail(BaseModel):
     vehicle:          str
+    trips:            int = 1
+    petrol_rate:      float = 94.37
     fuel:             float
     driver:           float
     toll:             float
@@ -167,15 +172,25 @@ class CostBreakdown(BaseModel):
 
 class OptimalStrategy(BaseModel):
     mandi:              str
+    mandi_name:         str   # Frontend compatibility
     distance_km:        float
     price_per_kg:       float
+    current_price:      float # Frontend compatibility
     days_to_wait:       int
     is_predicted_price: bool
     action_label:       str
+    recommendation:     str   # Frontend compatibility (descriptive)
     net_profit:         float
     net_profit_lower:   float
     net_profit_upper:   float
     margin_pct:         float
+    
+    # Flattened for frontend
+    gross_revenue:      float
+    transport_cost:     float
+    storage_cost:       float
+    predicted_price_7d: Optional[float] = None
+    
     cost_breakdown:     CostBreakdown
 
 
@@ -183,10 +198,13 @@ class RecommendResponse(BaseModel):
     request_id:          str
     crop:                str
     quantity_kg:         float
+    quantity:            float # Frontend compatibility
     farmer_location:     str
     recommendation:      str
+    summary:             str   # Frontend compatibility
     justification:       str
     optimal_strategy:    OptimalStrategy
+    best_option:         OptimalStrategy # Frontend compatibility
     alternative_count:   int
     alternatives:        List[Dict]
     model_report_url:    str
@@ -297,6 +315,26 @@ async def model_report():
     return predictor.get_model_report().to_dict(orient="records")
 
 
+@app.get("/config/petrol")
+async def get_petrol():
+    """Return the current petrol price used for transport cost calculations."""
+    return {"petrol_price_per_litre": get_petrol_price()}
+
+
+@app.post("/config/petrol")
+async def update_petrol(body: dict):
+    """Update petrol price globally (affects all subsequent recommendations)."""
+    price = body.get("price_per_litre")
+    if not price or price <= 0 or price > 500:
+        raise HTTPException(status_code=422, detail="price_per_litre must be between 0 and 500")
+    set_petrol_price(float(price))
+    return {
+        "status": "updated",
+        "petrol_price_per_litre": get_petrol_price(),
+        "message": f"Petrol price set to Rs {price:.2f}/L for all future calculations.",
+    }
+
+
 @app.post("/recommend", response_model=RecommendResponse)
 async def recommend(request: RecommendRequest):
     """Get ML-based mandi recommendation for maximum net profit."""
@@ -320,6 +358,7 @@ async def recommend(request: RecommendRequest):
             current_location = request.farmer_location,
             df_current       = df_current,
             df_forecast      = df_forecast,
+            petrol_price     = request.petrol_price,
         )
     except Exception as exc:
         logger.exception("Strategy generation failed")
@@ -332,42 +371,74 @@ async def recommend(request: RecommendRequest):
     bd  = opt["cost_breakdown"]
     td  = bd.get("transport_detail", {})
 
+    # Compatibility: flatten alternative scenarios
+    alternatives = []
+    for sc in result.get("alternative_scenarios", []):
+        s_bd = sc.get("cost_breakdown", {})
+        alternatives.append({
+            "mandi_name":     sc["mandi_name"], # Fix: engineer uses mandi_name in raw list
+            "distance_km":    sc["distance_km"],
+            "current_price":  sc["price_per_kg"],
+            "net_profit":     sc["net_profit"],
+            "recommendation": sc["action_label"],
+            # flatten others if needed
+        })
+
+    # Find 7-day predicted price for hero section
+    p_t7 = None
+    if df_forecast is not None:
+        f_mandi = df_forecast[df_forecast["Mandi_Name"] == opt["mandi"]]
+        if not f_mandi.empty:
+            p_t7 = float(f_mandi[f_mandi["Day_Ahead"] == 7]["Predicted_Price"].iloc[0])
+
+    strategy = OptimalStrategy(
+        mandi              = opt["mandi"],
+        mandi_name         = opt["mandi"], # Alias
+        distance_km        = opt["distance_km"],
+        price_per_kg       = opt["price_per_kg"],
+        current_price      = opt["price_per_kg"], # Alias
+        days_to_wait       = opt["days_to_wait"],
+        is_predicted_price = opt["is_predicted_price"],
+        action_label       = opt["action_label"],
+        recommendation     = result["recommendation"], # descriptive
+        net_profit         = opt["net_profit"],
+        net_profit_lower   = opt.get("net_profit_lower", opt["net_profit"]),
+        net_profit_upper   = opt.get("net_profit_upper", opt["net_profit"]),
+        margin_pct         = opt["margin_pct"],
+        gross_revenue      = bd["gross_revenue"],
+        transport_cost     = bd["transport_cost"],
+        storage_cost       = bd["storage_cost"],
+        predicted_price_7d = p_t7,
+        cost_breakdown     = CostBreakdown(
+            gross_revenue      = bd["gross_revenue"],
+            transport_cost     = bd["transport_cost"],
+            transport_detail   = TransportDetail(
+                vehicle           = td.get("vehicle", "LCV"),
+                fuel              = td.get("fuel", 0),
+                driver            = td.get("driver", 0),
+                toll              = td.get("toll", 0),
+                maintenance       = td.get("maintenance", 0),
+                loading_unloading = td.get("loading_unloading", 0),
+            ),
+            storage_cost       = bd["storage_cost"],
+            perishability_cost = bd["perishability_cost"],
+            qty_remaining_kg   = bd["qty_remaining_kg"],
+        ),
+    )
+
     return RecommendResponse(
         request_id       = rid,
         crop             = request.crop,
         quantity_kg      = request.quantity,
+        quantity         = request.quantity, # Alias
         farmer_location  = request.farmer_location,
         recommendation   = result["recommendation"],
+        summary          = result["recommendation"], # Alias
         justification    = result["justification"],
-        optimal_strategy = OptimalStrategy(
-            mandi              = opt["mandi"],
-            distance_km        = opt["distance_km"],
-            price_per_kg       = opt["price_per_kg"],
-            days_to_wait       = opt["days_to_wait"],
-            is_predicted_price = opt["is_predicted_price"],
-            action_label       = opt["action_label"],
-            net_profit         = opt["net_profit"],
-            net_profit_lower   = opt.get("net_profit_lower", opt["net_profit"]),
-            net_profit_upper   = opt.get("net_profit_upper", opt["net_profit"]),
-            margin_pct         = opt["margin_pct"],
-            cost_breakdown     = CostBreakdown(
-                gross_revenue      = bd["gross_revenue"],
-                transport_cost     = bd["transport_cost"],
-                transport_detail   = TransportDetail(
-                    vehicle           = td.get("vehicle", "LCV"),
-                    fuel              = td.get("fuel", 0),
-                    driver            = td.get("driver", 0),
-                    toll              = td.get("toll", 0),
-                    maintenance       = td.get("maintenance", 0),
-                    loading_unloading = td.get("loading_unloading", 0),
-                ),
-                storage_cost       = bd["storage_cost"],
-                perishability_cost = bd["perishability_cost"],
-                qty_remaining_kg   = bd["qty_remaining_kg"],
-            ),
-        ),
-        alternative_count = len(result.get("alternative_scenarios", [])),
-        alternatives      = result.get("alternative_scenarios", []),
+        optimal_strategy = strategy,
+        best_option      = strategy, # Alias
+        alternative_count = len(alternatives),
+        alternatives      = alternatives,
         model_report_url  = "/model_report",
     )
 
@@ -396,4 +467,4 @@ async def submit_feedback(request: FeedbackRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api.ml_api:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("api.ml_api:app", host="0.0.0.0", port=8000, reload=True)

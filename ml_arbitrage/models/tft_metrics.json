@@ -1,0 +1,9 @@
+{
+  "rmse": 1.3808,
+  "mae": 1.0265,
+  "mape": 4.48,
+  "training_time_sec": 412.2,
+  "n_parameters": 107679,
+  "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "epochs_trained": 11
+}

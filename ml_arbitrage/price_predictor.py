@@ -135,6 +135,11 @@ class PricePredictor:
             df["Is_Weekend"] = (df["Date"].dt.dayofweek >= 5).astype(int)
 
         # Per-group lag and rolling features
+        # NOTE: pandas 2.x+ may drop groupby-key columns from .apply() results
+        # even with group_keys=False.  We save and restore them explicitly.
+        _saved_mandi = df["Mandi_Name"].values.copy()
+        _saved_crop  = df["Crop"].values.copy()
+
         groups = df.groupby(["Mandi_Name", "Crop"], group_keys=False)
 
         def _add_group_features(g: pd.DataFrame) -> pd.DataFrame:
@@ -157,6 +162,12 @@ class PricePredictor:
             return g
 
         df = groups.apply(_add_group_features).reset_index(drop=True)
+
+        # Restore groupby-key columns if pandas dropped them
+        if "Mandi_Name" not in df.columns:
+            df["Mandi_Name"] = _saved_mandi
+        if "Crop" not in df.columns:
+            df["Crop"] = _saved_crop
 
         # Fill remaining NaN in lag columns with group means (safe fallback)
         for col in ["price_lag_1", "price_lag_3", "price_lag_7", "price_lag_14"]:

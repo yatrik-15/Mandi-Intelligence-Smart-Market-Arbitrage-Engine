@@ -57,14 +57,28 @@ logger = logging.getLogger(__name__)
 # Transport cost constants (sourced, March 2026)
 # ──────────────────────────────────────────────────────────────────────────────
 
-PETROL_PRICE_PER_LITRE: float = 94.37    # ₹/L  (user-specified)
+_PETROL_PRICE_PER_LITRE: float = 94.37   # ₹/L  (default, updatable at runtime)
 NH_TOLL_PER_KM:         float = 2.10     # ₹/km national highway
 SH_TOLL_PER_KM:         float = 0.70     # ₹/km state highway
 NH_COVERAGE:            float = 0.65     # 65 % of Gujarat routes on NH
 MAINTENANCE_PER_KM:     float = 1.75     # ₹/km
-LOADING_UNLOADING:      float = 1_500.0  # ₹/trip
+LOADING_UNLOADING:      float = 1_500.0  # ₹/trip (per trip)
 AVG_SPEED_KMPH:         float = 45.0     # km/h loaded
 STORAGE_COST_PER_QUINTAL_DAY: float = 50.0  # ₹/quintal/day (cold storage)
+
+
+def get_petrol_price() -> float:
+    """Return the current petrol price used for cost calculation."""
+    return _PETROL_PRICE_PER_LITRE
+
+
+def set_petrol_price(price_per_litre: float) -> None:
+    """Update petrol price at runtime (e.g. from API request or config)."""
+    global _PETROL_PRICE_PER_LITRE
+    if price_per_litre <= 0:
+        raise ValueError("Petrol price must be positive.")
+    _PETROL_PRICE_PER_LITRE = price_per_litre
+    logger.info("Petrol price updated to ₹%.2f/L", price_per_litre)
 
 # Vehicle profiles: (efficiency kmpl, driver ₹/day, payload quintal)
 _VEHICLES = {
@@ -87,31 +101,55 @@ def _transport_cost(
     distance_km: float,
     qty_quintal: float,
     travels: bool = True,
+    petrol_override: Optional[float] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Five-component transport cost.
+    Five-component transport cost with multi-trip scaling.
+
+    If the quantity exceeds one vehicle's payload, multiple trips are
+    computed.  Each trip incurs its own fuel, driver, toll, maintenance,
+    and loading/unloading costs.
+
+    Parameters
+    ----------
+    petrol_override : optional ₹/L to use instead of the module default.
 
     Returns
     -------
     (total_cost_inr, breakdown_dict)
     """
     if not travels or distance_km <= 0:
-        return 0.0, {"fuel": 0, "driver": 0, "toll": 0, "maintenance": 0, "loading_unloading": 0}
+        return 0.0, {"vehicle": "NONE", "trips": 0, "fuel": 0, "driver": 0,
+                     "toll": 0, "maintenance": 0, "loading_unloading": 0}
 
-    v_name, eff, wage, _ = _select_vehicle(qty_quintal)
+    petrol = petrol_override if petrol_override and petrol_override > 0 else _PETROL_PRICE_PER_LITRE
+    v_name, eff, wage, payload_q = _select_vehicle(qty_quintal)
 
-    litres      = distance_km / eff
-    fuel        = litres * PETROL_PRICE_PER_LITRE
-    rt_hours    = (distance_km / AVG_SPEED_KMPH) * 2.0 + 1.5
-    driver      = rt_hours * (wage / 8.0)
-    blended_toll= NH_COVERAGE * NH_TOLL_PER_KM + (1 - NH_COVERAGE) * SH_TOLL_PER_KM
-    toll        = distance_km * blended_toll
-    maintenance = distance_km * MAINTENANCE_PER_KM
-    lu          = LOADING_UNLOADING
+    # Number of trips needed (ceil division)
+    n_trips = max(1, math.ceil(qty_quintal / payload_q))
+
+    # Per-trip costs
+    litres_per_trip   = distance_km / eff
+    fuel_per_trip     = litres_per_trip * petrol
+    rt_hours          = (distance_km / AVG_SPEED_KMPH) * 2.0 + 1.5  # round-trip + load time
+    driver_per_trip   = rt_hours * (wage / 8.0)
+    blended_toll_km   = NH_COVERAGE * NH_TOLL_PER_KM + (1 - NH_COVERAGE) * SH_TOLL_PER_KM
+    toll_per_trip     = distance_km * blended_toll_km
+    maint_per_trip    = distance_km * MAINTENANCE_PER_KM
+    lu_per_trip       = LOADING_UNLOADING
+
+    # Scale by number of trips
+    fuel        = fuel_per_trip     * n_trips
+    driver      = driver_per_trip   * n_trips
+    toll        = toll_per_trip     * n_trips
+    maintenance = maint_per_trip    * n_trips
+    lu          = lu_per_trip       * n_trips
 
     total = fuel + driver + toll + maintenance + lu
     breakdown = {
         "vehicle":          v_name,
+        "trips":            n_trips,
+        "petrol_rate":      round(petrol, 2),
         "fuel":             round(fuel, 2),
         "driver":           round(driver, 2),
         "toll":             round(toll, 2),
@@ -162,6 +200,7 @@ class ArbitrageEngine:
         df_current:          Optional[pd.DataFrame] = None,
         df_forecast:         Optional[pd.DataFrame] = None,
         crop_perishability_factor: Optional[float] = None,
+        petrol_price:        Optional[float] = None,
     ) -> Dict:
         """
         Main recommendation entry point.
@@ -208,6 +247,7 @@ class ArbitrageEngine:
                 wait_days    = 0,
                 λ            = λ,
                 is_forecast  = False,
+                petrol_price = petrol_price,
             )
             spatial_scenarios.append(s)
 
@@ -237,6 +277,7 @@ class ArbitrageEngine:
                         is_forecast = True,
                         price_lower = float(frow.get("Lower_Bound", frow["Predicted_Price"])),
                         price_upper = float(frow.get("Upper_Bound", frow["Predicted_Price"])),
+                        petrol_price = petrol_price,
                     )
                     temporal_scenarios.append(s)
 
@@ -272,23 +313,26 @@ class ArbitrageEngine:
         is_forecast: bool,
         price_lower: Optional[float] = None,
         price_upper: Optional[float] = None,
+        petrol_price: Optional[float] = None,
     ) -> Dict:
         """Compute one scenario's full economics."""
         qty_kg_original = qty_quintal * 100
         # Exponential decay
         qty_remaining   = qty_quintal * math.exp(-λ * wait_days)
         qty_kg_remaining= qty_remaining * 100
-        gross_revenue   = qty_remaining * price  # ₹ / quintal × quintal
+        gross_revenue   = qty_kg_remaining * price  # ₹ / kg × kg
 
         # Transport (only for non-zero distance)
-        travels = distance_km > 0 and wait_days <= 3   # travel scenarios = days 0 or 3
-        transport_total, transport_bd = _transport_cost(distance_km, qty_quintal, travels)
+        travels = distance_km > 0 
+        transport_total, transport_bd = _transport_cost(
+            distance_km, qty_quintal, travels, petrol_override=petrol_price
+        )
 
         # Storage (quintal-day rate)
         storage_cost    = wait_days * qty_quintal * STORAGE_COST_PER_QUINTAL_DAY
 
         # Spoilage value lost
-        spoilage_cost   = (qty_quintal - qty_remaining) * price
+        spoilage_cost   = (qty_kg_original - qty_kg_remaining) * price
 
         net_profit      = gross_revenue - transport_total - storage_cost - spoilage_cost
 

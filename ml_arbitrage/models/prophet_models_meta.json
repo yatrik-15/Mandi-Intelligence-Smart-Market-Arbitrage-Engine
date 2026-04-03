@@ -1,0 +1,191 @@
+{
+  "Ahmedabad_Onion": {
+    "mandi": "Ahmedabad",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.301532",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Ahmedabad_Potato": {
+    "mandi": "Ahmedabad",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.301607",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Ahmedabad_Tomato": {
+    "mandi": "Ahmedabad",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.301648",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Amreli_Onion": {
+    "mandi": "Amreli",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.301685",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Amreli_Potato": {
+    "mandi": "Amreli",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.301721",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Amreli_Tomato": {
+    "mandi": "Amreli",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.301756",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Anand_Onion": {
+    "mandi": "Anand",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.301791",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Anand_Potato": {
+    "mandi": "Anand",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.301826",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Anand_Tomato": {
+    "mandi": "Anand",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.301860",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Bharuch_Onion": {
+    "mandi": "Bharuch",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.301894",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Bharuch_Potato": {
+    "mandi": "Bharuch",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.301928",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Bharuch_Tomato": {
+    "mandi": "Bharuch",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.301962",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Mehsana_Onion": {
+    "mandi": "Mehsana",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.301994",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Mehsana_Potato": {
+    "mandi": "Mehsana",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.302051",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Mehsana_Tomato": {
+    "mandi": "Mehsana",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.302097",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Rajkot_Onion": {
+    "mandi": "Rajkot",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.302132",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Rajkot_Potato": {
+    "mandi": "Rajkot",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.302166",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Rajkot_Tomato": {
+    "mandi": "Rajkot",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.302210",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Surat_Onion": {
+    "mandi": "Surat",
+    "crop": "Onion",
+    "trained_at": "2026-03-31 17:22:22.302243",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Surat_Potato": {
+    "mandi": "Surat",
+    "crop": "Potato",
+    "trained_at": "2026-03-31 17:22:22.302276",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  },
+  "Surat_Tomato": {
+    "mandi": "Surat",
+    "crop": "Tomato",
+    "trained_at": "2026-03-31 17:22:22.302308",
+    "trend_range": [
+      14.923037083645626,
+      16.6031781324
+    ]
+  }
+}

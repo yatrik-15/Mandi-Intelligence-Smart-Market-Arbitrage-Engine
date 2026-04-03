@@ -191,10 +191,8 @@ def get_distance(from_location: str, to_location: str) -> float:
         la2, lo2 = _CITY_COORDS[b]
         return round(_haversine_km(la1, lo1, la2, lo2), 1)
 
-    # 4. One-sided GPS + hub
-    for city in _CITY_COORDS:
-        if a in _DISTANCE_MATRIX.get((a, city), {}) or b in _DISTANCE_MATRIX.get((b, city), {}):
-            break
+    # 4. Neither hub routing nor GPS available for both cities
+    #    Return a conservative default for intra-Gujarat distances.
 
     return 150.0  # conservative default for Gujarat
 

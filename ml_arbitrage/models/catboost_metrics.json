@@ -1,0 +1,10 @@
+{
+  "accuracy": 1.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1_score": 1.0,
+  "training_time_sec": 17.6,
+  "n_train": 24427,
+  "n_val": 6107,
+  "trained_at": "2026-03-31 17:29:41.147136"
+}
