@@ -3,3 +3,6 @@ __pycache__/
 .env
 venv/
 .DS_Store
+
+# Raw API download cache (re-creatable with scripts/fetch_agmarknet.py)
+dataset/raw/

@@ -1,22 +1,12 @@
 """
-ml_arbitrage/distance_calculator.py — Gujarat Distance Engine v3.0
-====================================================================
-FIXES FROM v2.x
----------------
-  ❌ BUG: Hub routing applied a fixed 10 % overhead regardless of geometry.
-  ❌ BUG: `estimate_distance_fallback` used unsigned difference — impossible
-          to distinguish east-vs-west routes across the state.
-  ❌ MISSING: Coordinates-based Haversine fallback for completely unknown cities.
-  ❌ MISSING: No caching — called per-row in the data loader (O(n) lookups).
-  ❌ MISSING: Jamnagar, Bhavnagar, Gondal, Unjha, Wankaner not in matrix.
+distance_calculator.py — Road distances between Gujarat locations.
 
-NEW IN v3.0
------------
-  ✅ Expanded distance matrix — 20+ Gujarat cities with real road distances.
-  ✅ Haversine GPS fallback for cities not in matrix (uses approximate coords).
-  ✅ LRU cache on `get_distance()` — eliminates redundant lookups per row.
-  ✅ Corrected hub-overhead: 5–15 % based on detour ratio, not flat 10 %.
-  ✅ `calculate_distances_from_location()` returns sorted dict for UI display.
+Resolution order for get_distance(a, b):
+  1. Known road distance from the matrix below (Google Maps / NH figures).
+  2. Great-circle distance between known town coordinates × 1.25 road factor
+     (calibrated on the matrix: Gujarat road/straight-line ratios are ~1.1–1.3).
+  3. Routing through a hub city that has matrix distances to both ends.
+Unknown locations raise UnknownLocationError rather than guessing.
 """
 
 from __future__ import annotations
@@ -124,7 +114,52 @@ _CITY_COORDS: Dict[str, Tuple[float, float]] = {
     "anand":       (22.5645, 72.9289),
     "bilimora":    (20.7713, 72.9610),
     "damnagar":    (21.6966, 71.5237),
-    "vadhvan":     (22.3697, 71.6772),
+    "vadhvan":     (22.7020, 71.6800),
+    # Further APMC towns (approximate town-centre coordinates)
+    "kalol":       (23.2460, 72.5000),
+    "deesa":       (24.2585, 72.1907),
+    "palanpur":    (24.1725, 72.4381),
+    "patan":       (23.8493, 72.1266),
+    "himatnagar":  (23.5970, 72.9630),
+    "modasa":      (23.4627, 73.2985),
+    "idar":        (23.8380, 73.0020),
+    "visnagar":    (23.6980, 72.5470),
+    "vijapur":     (23.5620, 72.7470),
+    "kadi":        (23.2990, 72.3320),
+    "nadiad":      (22.6939, 72.8616),
+    "khambhat":    (22.3181, 72.6189),
+    "borsad":      (22.4078, 72.8990),
+    "kapadvanj":   (23.0230, 73.0710),
+    "godhra":      (22.7788, 73.6143),
+    "lunawada":    (23.1280, 73.6100),
+    "halol":       (22.5030, 73.4720),
+    "dahod":       (22.8350, 74.2550),
+    "rajpipla":    (21.8700, 73.5030),
+    "ankleshwar":  (21.6264, 73.0152),
+    "bardoli":     (21.1230, 73.1120),
+    "navsari":     (20.9467, 72.9520),
+    "valsad":      (20.5992, 72.9342),
+    "vapi":        (20.3893, 72.9106),
+    "surendranagar": (22.7276, 71.6480),
+    "dhrangadhra": (22.9920, 71.4680),
+    "morbi":       (22.8173, 70.8370),
+    "jasdan":      (22.0370, 71.2050),
+    "jetpur":      (21.7540, 70.6230),
+    "dhoraji":     (21.7340, 70.4500),
+    "upleta":      (21.7400, 70.2830),
+    "porbandar":   (21.6417, 69.6293),
+    "veraval":     (20.9070, 70.3680),
+    "talala":      (21.0530, 70.5330),
+    "keshod":      (21.3000, 70.2500),
+    "una":         (20.8230, 71.0390),
+    "mahuva":      (21.0900, 71.7600),
+    "botad":       (22.1700, 71.6680),
+    "palitana":    (21.5250, 71.8250),
+    "savarkundla": (21.3370, 71.3060),
+    "visavadar":   (21.3380, 70.7470),
+    "bhuj":        (23.2420, 69.6669),
+    "gandhidham":  (23.0753, 70.1337),
+    "dwarka":      (22.2394, 68.9678),
 }
 
 # Name aliases — maps variant spellings → canonical name
@@ -135,7 +170,18 @@ _ALIASES: Dict[str, str] = {
     "mehsana":      "mehsana",
     "saurashtra":   "rajkot",
     "gandhi nagar": "gandhinagar",
+    "siddhpur":     "sidhpur",
+    "nadiyad":      "nadiad",
+    "vankaner":     "wankaner",
+    "wadhwan":      "vadhvan",
+    "talalagir":    "talala",
 }
+
+ROAD_FACTOR = 1.25
+
+
+class UnknownLocationError(ValueError):
+    """Raised when a location is neither in the matrix nor in the coordinate table."""
 
 _HUB_CITIES = ["gandhinagar", "ahmedabad", "vadodara", "rajkot", "surat"]
 
@@ -147,66 +193,48 @@ def _normalise(name: str) -> str:
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in km (used as fallback road estimate × 1.4)."""
-    R = 6371.0
-    φ1, φ2   = math.radians(lat1), math.radians(lat2)
-    Δφ        = math.radians(lat2 - lat1)
-    Δλ        = math.radians(lon2 - lon1)
-    a         = math.sin(Δφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(Δλ / 2) ** 2
-    gc_dist   = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return gc_dist * 1.40   # road-to-straight-line factor for Gujarat's road network
+    """Great-circle distance in km."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def known_locations() -> List[str]:
+    """Every location name get_distance() can resolve (title case)."""
+    names = {n for pair in _DISTANCE_MATRIX for n in pair} | set(_CITY_COORDS)
+    return sorted(n.title() for n in names)
+
+
+def is_known_location(name: str) -> bool:
+    n = _normalise(name)
+    return n in _CITY_COORDS or any(n == a for a, _ in _DISTANCE_MATRIX)
 
 
 @lru_cache(maxsize=4096)
 def get_distance(from_location: str, to_location: str) -> float:
-    """
-    Return road distance in km between two Gujarat locations.
-
-    Resolution order:
-    1. Direct lookup in distance matrix
-    2. Hub routing via Ahmedabad / Gandhinagar / Vadodara
-    3. Haversine GPS approximation × 1.4 road factor
-    4. Default 150 km if both cities are unknown
-
-    Result is cached — repeated calls for the same pair are O(1).
-    """
-    a = _normalise(from_location)
-    b = _normalise(to_location)
-
+    """Road distance in km between two Gujarat locations (cached)."""
+    a, b = _normalise(from_location), _normalise(to_location)
     if a == b:
         return 0.0
-
-    # 1. Direct lookup
     if (a, b) in _DISTANCE_MATRIX:
         return _DISTANCE_MATRIX[(a, b)]
-
-    # 2. Hub routing
-    best = _via_hubs(a, b)
-    if best is not None:
-        return best
-
-    # 3. Haversine GPS fallback
     if a in _CITY_COORDS and b in _CITY_COORDS:
-        la1, lo1 = _CITY_COORDS[a]
-        la2, lo2 = _CITY_COORDS[b]
-        return round(_haversine_km(la1, lo1, la2, lo2), 1)
-
-    # 4. Neither hub routing nor GPS available for both cities
-    #    Return a conservative default for intra-Gujarat distances.
-
-    return 150.0  # conservative default for Gujarat
+        return round(_haversine_km(*_CITY_COORDS[a], *_CITY_COORDS[b]) * ROAD_FACTOR, 1)
+    via_hub = _via_hubs(a, b)
+    if via_hub is not None:
+        return via_hub
+    unknown = [n for n in (from_location, to_location) if not is_known_location(n)]
+    raise UnknownLocationError(f"Unknown location(s): {unknown}")
 
 
 def _via_hubs(a: str, b: str) -> Optional[float]:
-    """Try routing a→hub→b through each hub city."""
-    for hub in _HUB_CITIES:
-        d_ah = _DISTANCE_MATRIX.get((a, hub)) or _DISTANCE_MATRIX.get((hub, a))
-        d_hb = _DISTANCE_MATRIX.get((hub, b)) or _DISTANCE_MATRIX.get((b, hub))
-        if d_ah is not None and d_hb is not None:
-            # Overhead: 5 % if hub is geographically between, 15 % otherwise
-            overhead = 1.05 if hub not in (a, b) else 1.15
-            return round((d_ah + d_hb) * overhead, 1)
-    return None
+    """Shortest a → hub → b route over hubs with matrix distances to both ends."""
+    routes = [_DISTANCE_MATRIX[(a, h)] + _DISTANCE_MATRIX[(h, b)]
+              for h in _HUB_CITIES
+              if (a, h) in _DISTANCE_MATRIX and (h, b) in _DISTANCE_MATRIX]
+    return round(min(routes), 1) if routes else None
 
 
 def calculate_distances_from_location(

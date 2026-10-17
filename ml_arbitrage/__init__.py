@@ -1,13 +1,12 @@
 """
-ML-Powered Mandi Arbitrage Engine v3.0
-=======================================
-Four-Stage Ensemble Pipeline: Prophet → TFT → ArbitrageMath → CatBoost
+Mandi Intelligence — price forecasting and net-profit arbitrage for Gujarat mandis.
 
-Stages:
-  1A — Prophet  : Macro trend decomposition + gap imputation
-  1B — TFT      : Multi-horizon price forecast (t+3, t+7)
-  2  — Math     : Net Profit computation per logistics scenario
-  3  — CatBoost : Optimal action classification
+    data_loader         raw AGMARKNET CSV → clean daily panel
+    features            leakage-free multi-horizon features
+    forecaster          per-crop pooled XGBoost (1–14 day horizons)
+    arbitrage_engine    transport / storage / spoilage economics → recommendation
+    distance_calculator road distances between Gujarat towns
+    service             wires the above together for the API and CLI
 """
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
